@@ -9,7 +9,13 @@ import ilog.concert.IloException;
 import ilog.concert.IloIntVar;
 import ilog.concert.IloLinearNumExpr;
 import ilog.concert.IloNumVar;
+import ilog.concert.IloRange;
 import ilog.cplex.IloCplex;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Random;
 
 /**
@@ -17,6 +23,10 @@ import java.util.Random;
  * @author michael
  */
 public class Network {
+    
+    public final double epsilon = 0.001;
+    
+    
     private Node[] nodes;
     private int[][] cost;
     private int capacity;
@@ -52,6 +62,169 @@ public class Network {
         }
     }
     
+    
+    private Map<Link, IloRange> bounds;
+    private PriorityQueue<BranchNode> branchnodes;
+    private IloNumVar[][] x;
+    private IloNumVar[] u;
+    
+    private double best_ub = Integer.MAX_VALUE;
+    
+    public void branchAndBound() throws IloException {
+        x = new IloNumVar[nodes.length][nodes.length];
+        
+        for(int i = 0; i < nodes.length; i++){
+            for(int j = 0; j < nodes.length; j++){
+                if(i != j){
+                    x[i][j] = cplex.numVar(0, 1);
+                }
+            }
+        }
+        
+        // obj
+        IloLinearNumExpr lhs = cplex.linearNumExpr();
+        
+        for(int i = 0; i < nodes.length; i++){
+            for(int j = 0; j < nodes.length; j++){
+                if(i != j){
+                    lhs.addTerm(x[i][j], cost[i][j]);
+                }
+            }
+        }
+        
+        cplex.addMinimize(lhs);
+        
+        
+        for(int j = 0; j < nodes.length; j++){
+            lhs = cplex.linearNumExpr();
+            IloLinearNumExpr lhs2 = cplex.linearNumExpr();
+            
+            for(int i = 0; i < nodes.length; i++){
+                if(i != j){
+                    lhs.addTerm(x[i][j], 1);
+                    lhs2.addTerm(x[j][i], 1);
+                }
+            }
+            
+            if(j == 0){
+                cplex.addEq(lhs, k);
+                cplex.addEq(lhs2, k);
+            }
+            else{
+                cplex.addEq(lhs, 1);
+                cplex.addEq(lhs2, 1);
+            }
+        }
+        
+        
+        u = new IloNumVar[nodes.length];
+        
+        for(int i = 1; i < u.length; i++){
+            u[i] = cplex.numVar(0, Integer.MAX_VALUE);
+        }
+        
+        for(int i = 1; i < nodes.length; i++){
+            cplex.addGe(u[i], nodes[i].demand);
+            cplex.addLe(u[i], capacity);
+            
+            
+            for(int j = 1; j < nodes.length; j++){
+                if(i != j){
+                    cplex.addLe(cplex.sum(cplex.sum(u[i], cplex.prod(-1, u[j])), cplex.prod(capacity, x[i][j])),
+                        capacity - nodes[j].demand);
+                }
+            }
+        }
+        
+        
+        branchnodes = new PriorityQueue<BranchNode>();
+        bounds = new HashMap<>();
+        
+        branchnodes.add(new BranchNode(0));
+        
+        BranchNode prev = null;
+        
+        while(!branchnodes.isEmpty()){
+            BranchNode bnode = branchnodes.poll();
+            
+            if(bnode.lb > best_ub){
+                break;
+            }
+            evaluate(prev, bnode);
+            prev = bnode;
+        }
+    }
+    
+    
+    
+    public void evaluate(BranchNode prev, BranchNode child) throws IloException {
+        
+        Map<Link, IloRange> newBounds = new HashMap<>();
+        
+        // if prev is null then bounds is empty
+        for(Link l : bounds.keySet()){
+            
+            if(child.containsImposed(l)){
+                if(prev.containsImposed(l)){
+                    newBounds.put(l, bounds.get(l));
+                }
+                else if(prev.containsExcluded(l)){
+                    cplex.remove(bounds.get(l));
+                    newBounds.put(l, cplex.addEq(x[l.i][l.j], 1));
+                }
+            }
+            else if(child.containsExcluded(l)){
+                if(prev.containsExcluded(l)){
+                    newBounds.put(l, bounds.get(l));
+                }
+                else if(prev.containsImposed(l)){
+                    cplex.remove(bounds.get(l));
+                    newBounds.put(l, cplex.addEq(x[l.i][l.j], 0));
+                }
+            }
+        }
+        
+        bounds = newBounds;
+        
+        for(Link l : child.imposed){
+            if(!bounds.containsKey(l)){
+                bounds.put(l, cplex.addEq(x[l.i][l.j], 1));
+            }
+        }
+        
+        for(Link l : child.excluded){
+            if(!bounds.containsKey(l)){
+                bounds.put(l, cplex.addEq(x[l.i][l.j], 0));
+            }
+        }
+        
+        cplex.solve();
+        
+        List<Link> nonInteger = new ArrayList<>();
+        
+        for(int i = 0; i < nodes.length; i++){
+            for(int j = 0; j < nodes.length; j++){
+                if(i != j){
+                    double val = cplex.getValue(x[i][j]);
+                    
+                    if(Math.abs(val - 0) >= epsilon && Math.abs(val - 1) >= epsilon){
+                        nonInteger.add(new Link(i, j));
+                    }
+                }
+            }
+        }
+        
+        double obj = cplex.getObjValue();
+        
+        
+        
+        if(nonInteger.size() > 0){
+            // add branches
+        }
+        else{
+            best_ub = Math.min(best_ub, obj);
+        }
+    }
     
     
     
@@ -149,10 +322,12 @@ public class Network {
         return new Solution(output, obj);
     }
     
+    
+    
     public boolean validate(double[][] x){
         // everything is 0 or 1
         
-        double epsilon = 0.001;
+        
         
         for(int i = 0; i < x.length; i++){
             for(int j = 0; j < x.length; j++){
